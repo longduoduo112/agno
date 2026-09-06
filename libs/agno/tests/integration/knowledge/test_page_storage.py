@@ -1312,7 +1312,8 @@ def test_public_contention_preserves_completed_primary_and_cleans_up(corpus, mon
         )
         assert elapsed < 2 and primary_times and primary_times[0] - start < 1.5
         assert outcome.results and all(hit.revision == published.revision for hit in outcome.results)
-        assert outcome.partial and outcome.warnings == ("alternative_unavailable",)
+        assert not outcome.partial and outcome.warnings == ()
+        assert len(primary_times) == 2
         assert module.READ_WORKERS._capacity._value == 8
         assert knowledge._page_engine.pool.checkedout() == 1
         assert all(t < 2 for t in read_times)
@@ -1383,3 +1384,333 @@ def test_initialized_setup_during_sync_uses_validated_read_only_path(corpus, mon
         if hasattr(second, "_page_engine"):
             second._page_engine.dispose()
     assert len(outcome) == 1 and not isinstance(outcome[0], BaseException)
+
+
+def test_failed_initial_source_does_not_bind_namespace(corpus):
+    from agno.knowledge.page import SyncFailed
+
+    knowledge, embedder, site = corpus
+    with pytest.raises(SyncFailed):
+        knowledge.sync_pages(url="https://docs.example.com/typo.txt")
+    embedder.fail = True
+    assert knowledge.sync_pages(url="https://docs.example.com/llms.txt").status == "partial"
+    embedder.fail = False
+    site["https://docs.example.com/corrected.txt"] = site["https://docs.example.com/llms.txt"]
+    assert knowledge.sync_pages(url="https://docs.example.com/corrected.txt").updated == 1
+    with pytest.raises(ValueError, match="bound to another"):
+        knowledge.sync_pages(url="https://docs.example.com/llms.txt")
+
+
+@pytest.mark.parametrize("namespace", ["docs space", "docs%20encoded"])
+def test_namespace_literal_and_hnsw_build_options(engine, namespace):
+    from agno.vectordb.pgvector.index import HNSW
+
+    db = PostgresDb(db_engine=engine)
+    vector = PgVector(
+        db=db,
+        table_name="custom_" + uuid4().hex[:8],
+        embedder=RecordingEmbedder(),
+        vector_index=HNSW(m=24, ef_construction=123),
+    )
+    knowledge = Knowledge(content_db=db, page_store=FileSystem(db=db, namespace=namespace), vector_db=vector)
+    knowledge.setup()
+    knowledge.setup()
+    coordinator = knowledge._pages()
+    index_name = list(coordinator._search_indexes())[1][1]
+    with engine.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT pg_get_expr(i.indpred, i.indrelid), c.reloptions FROM pg_class c JOIN pg_index i ON i.indexrelid=c.oid WHERE c.relname=:name"
+            ),
+            {"name": index_name},
+        ).one()
+    assert knowledge.page_store.namespace in row[0]
+    assert "%%" not in row[0]
+    assert set(row[1]) == {"m=24", "ef_construction=123"}
+    vector.vector_index = HNSW(m=16, ef_construction=200)
+    with pytest.raises(ValueError, match="rebuild"):
+        knowledge.setup()
+
+
+def test_six_namespaces_concurrently_initialize_fresh_table(engine, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    barrier = Barrier(6)
+
+    def fetch(self, url, maximum):
+        return f"- [Page]({self.base}/page.md)" if url.endswith("llms.txt") else "# " + url
+
+    monkeypatch.setattr(PageSource, "fetch", fetch)
+    table = "setup_" + uuid4().hex[:8]
+
+    def initialize(index):
+        db = PostgresDb(db_engine=engine)
+        knowledge = Knowledge(
+            content_db=db,
+            page_store=FileSystem(db=db, namespace=f"concurrent-{table}-{index}"),
+            vector_db=PgVector(db=db, table_name=table, embedder=RecordingEmbedder()),
+        )
+        barrier.wait(timeout=5)
+        knowledge.setup()
+        knowledge.sync_pages(url=f"https://docs.example.com/n{index}/llms.txt")
+        return knowledge
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        initialized = list(pool.map(initialize, range(6)))
+    assert len(initialized) == 6
+    for index, knowledge in enumerate(initialized):
+        knowledge.setup()
+        pages = knowledge.list_pages().pages
+        assert len(pages) == 1 and pages[0].namespace == knowledge.page_store.namespace
+        assert knowledge.read_page("/page").text == f"# https://docs.example.com/n{index}/page.md"
+
+
+@pytest.mark.parametrize("held", [7, 8])
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_pool_checkout_budget_and_serial_fallback(corpus, held, async_mode):
+    import asyncio
+    import time
+
+    from agno.knowledge.page import SearchUnavailable
+
+    knowledge, _, _ = corpus
+    knowledge.sync_pages(url="https://docs.example.com/llms.txt")
+    warm_search_pool(knowledge, 8)
+    with ExitStack() as stack:
+        for _ in range(held):
+            stack.enter_context(knowledge._page_engine.connect())
+        start = time.monotonic()
+        if held == 8:
+            with pytest.raises(SearchUnavailable):
+                if async_mode:
+                    asyncio.run(knowledge.asearch_pages("Agent", alternatives=["tools"]))
+                else:
+                    knowledge.search_pages("Agent", alternatives=["tools"])
+        else:
+            result = (
+                asyncio.run(knowledge.asearch_pages("Agent", alternatives=["tools"]))
+                if async_mode
+                else knowledge.search_pages("Agent", alternatives=["tools"])
+            )
+            assert result.results and not result.partial
+        elapsed = time.monotonic() - start
+        print("CHECKOUT", {"held": held, "async": async_mode, "seconds": elapsed})
+        assert elapsed < 2.35
+    deadline = time.monotonic() + 1
+    while knowledge._page_engine.pool.checkedout() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert knowledge._page_engine.pool.checkedout() == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("batch", [False, True])
+async def test_upsert_embeds_missing_documents_once_before_replacement(engine, async_mode, batch):
+    from agno.exceptions import EmbeddingError
+    from agno.knowledge.document import Document
+
+    class Counter(RecordingEmbedder):
+        def get_embedding_and_usage(self, text):
+            return self.get_embedding(text), {"text": text}
+
+        async def async_get_embedding_and_usage(self, text):
+            return self.get_embedding_and_usage(text)
+
+        async def async_get_embeddings_batch_and_usage(self, texts):
+            pairs = [self.get_embedding_and_usage(value) for value in texts]
+            return [p[0] for p in pairs], [p[1] for p in pairs]
+
+    embedder = Counter()
+    embedder.enable_batch = batch
+    vector = PgVector(db=PostgresDb(db_engine=engine), table_name="upsert_" + uuid4().hex[:8], embedder=embedder)
+    vector.create()
+    documents = [
+        Document(content="prepared", embedding=[0.2, 0.5, 1], usage={"prepared": True}),
+        Document(content="missing"),
+        Document(content="empty", embedding=[]),
+    ]
+    if async_mode:
+        await vector.async_upsert("generation", documents)
+    else:
+        vector.upsert("generation", documents)
+    assert embedder.calls == ["missing", "empty"]
+    with engine.connect() as conn:
+        rows = {row.content: row for row in conn.execute(vector.table.select())}
+    assert len(rows) == 3
+    assert list(rows["prepared"].embedding) == pytest.approx([0.2, 0.5, 1])
+    assert rows["missing"].usage == {"text": "missing"}
+    assert rows["empty"].usage == {"text": "empty"}
+    embedder.fail = True
+    with pytest.raises((EmbeddingError, RuntimeError)):
+        if async_mode:
+            await vector.async_upsert("generation", [Document(content="replacement")])
+        else:
+            vector.upsert("generation", [Document(content="replacement")])
+    with engine.connect() as conn:
+        assert len(conn.execute(vector.table.select()).all()) == 3
+
+
+def test_concurrent_first_sync_failure_allows_corrected_source(corpus, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    from agno.knowledge.page import SyncFailed
+
+    knowledge, _, site = corpus
+    entered, release = Event(), Event()
+
+    def fetch(self, url, maximum):
+        if url.endswith("typo.txt"):
+            entered.set()
+            assert release.wait(5)
+            raise RuntimeError("unpublished source typo")
+        return site[url]
+
+    monkeypatch.setattr(PageSource, "fetch", fetch)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(knowledge.sync_pages, url="https://docs.example.com/typo.txt")
+        assert entered.wait(5)
+        second = pool.submit(knowledge.sync_pages, url="https://docs.example.com/llms.txt")
+        release.set()
+        with pytest.raises(SyncFailed):
+            first.result(timeout=5)
+        assert second.result(timeout=5).updated == 1
+    assert knowledge.read_page("/agent").text == site["https://docs.example.com/agent.md"]
+
+
+def test_recycled_primary_connection_and_optional_fallback(corpus):
+    from sqlalchemy import event
+
+    knowledge, _, _ = corpus
+    knowledge.sync_pages(url="https://docs.example.com/llms.txt")
+    engine = knowledge._page_engine
+    established = []
+
+    def record_connect(connection, record):
+        established.append(1)
+
+    def age_connection(connection, record):
+        # Exercise SQLAlchemy's actual recycle branch on the next checkout.
+        record.starttime = 0
+
+    event.listen(engine, "connect", record_connect)
+    event.listen(engine, "checkin", age_connection)
+    try:
+        for _ in range(3):
+            result = knowledge.search_pages("Agent", alternatives=["tools"])
+            assert result.results and not result.partial
+        assert len(established) >= 2
+        assert engine.pool.checkedout() == 0
+    finally:
+        event.remove(engine, "connect", record_connect)
+        event.remove(engine, "checkin", age_connection)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("batch", [False, True])
+@pytest.mark.parametrize("replacement", [False, True])
+async def test_generic_upsert_preserves_partial_embeddings_without_reembedding(engine, async_mode, batch, replacement):
+    from agno.knowledge.document import Document
+
+    class PartialEmbedder(RecordingEmbedder):
+        def get_embedding_and_usage(self, text):
+            self.calls.append(text)
+            if self.fail:
+                raise RuntimeError("provider failed")
+            return ([] if text == "unusable" else [1.0, 0.5, 0.2]), {"text": text}
+
+        async def async_get_embedding_and_usage(self, text):
+            return self.get_embedding_and_usage(text)
+
+        async def async_get_embeddings_batch_and_usage(self, texts):
+            pairs = [self.get_embedding_and_usage(value) for value in texts]
+            return [pair[0] for pair in pairs], [pair[1] for pair in pairs]
+
+    embedder = PartialEmbedder()
+    embedder.enable_batch = batch
+    vector = PgVector(db=PostgresDb(db_engine=engine), table_name="partial_" + uuid4().hex[:8], embedder=embedder)
+    vector.create()
+    if replacement:
+        vector.upsert("generation", [Document(content="old")])
+    embedder.calls.clear()
+    documents = [Document(content="usable"), Document(content="unusable")]
+    if async_mode:
+        await vector.async_upsert("generation", documents)
+    else:
+        vector.upsert("generation", documents)
+    assert embedder.calls == ["usable", "unusable"]
+    assert documents[1].embedding == []  # Ingestion can still account for the shortfall.
+    with engine.connect() as conn:
+        rows = conn.execute(vector.table.select()).all()
+    assert [row.content for row in rows] == ["usable"]
+    assert rows[0].usage == {"text": "usable"}
+    embedder.fail = True
+    with pytest.raises(RuntimeError, match="provider failed"):
+        if async_mode:
+            await vector.async_upsert("generation", [Document(content="replacement")])
+        else:
+            vector.upsert("generation", [Document(content="replacement")])
+    with engine.connect() as conn:
+        assert [row.content for row in conn.execute(vector.table.select())] == ["usable"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_mode", [False, True])
+async def test_generic_knowledge_tracks_partial_embedding_ingestion(engine, async_mode):
+    from agno.knowledge.document import Document
+    from agno.knowledge.reader.base import Reader
+
+    class PartialEmbedder(RecordingEmbedder):
+        def get_embedding_and_usage(self, text):
+            self.calls.append(text)
+            return ([] if text == "unusable" else [1.0, 0.5, 0.2]), None
+
+        async def async_get_embedding_and_usage(self, text):
+            return self.get_embedding_and_usage(text)
+
+    class SplitReader(Reader):
+        def read(self, *args, **kwargs):
+            return [Document(content="usable"), Document(content="unusable")]
+
+        async def async_read(self, *args, **kwargs):
+            return self.read()
+
+    name = "partial_knowledge_" + uuid4().hex[:8]
+    embedder = PartialEmbedder()
+    db = PostgresDb(db_engine=engine)
+    vector = PgVector(db=db, table_name=name, embedder=embedder)
+    vector.create()
+    knowledge = Knowledge(content_db=db, vector_db=vector)
+    if async_mode:
+        await knowledge.ainsert(name=name, text_content="source document", reader=SplitReader())
+    else:
+        knowledge.insert(name=name, text_content="source document", reader=SplitReader())
+    contents, _ = knowledge.get_content()
+    content = next(item for item in contents if item.name == name)
+    assert content.status.value == "partial"
+    assert "1 of 2 chunks" in content.status_message
+    assert embedder.calls == ["usable", "unusable"]
+    with engine.connect() as conn:
+        assert [row.content for row in conn.execute(vector.table.select())] == ["usable"]
+
+
+def test_legacy_default_hnsw_index_requires_explicit_operator_rebuild(corpus):
+    import re
+
+    knowledge, _, _ = corpus
+    assert knowledge.sync_pages(url="https://docs.example.com/llms.txt").updated == 1
+    coordinator = knowledge._pages()
+    schema, name, table, definition = list(coordinator._search_indexes())[1]
+    legacy = re.sub(r" WITH \([^)]*\)", "", definition)
+    with knowledge._page_engine.begin() as conn:
+        conn.execute(text(f'DROP INDEX "{schema}"."{name}"'))
+        conn.execute(text(f'CREATE INDEX "{name}" ON {table} {legacy}'))
+    with pytest.raises(ValueError, match="rebuild .*ef_construction=200"):
+        knowledge.setup()
+    with knowledge._page_engine.connect() as conn:
+        assert (
+            conn.execute(text("SELECT reloptions FROM pg_class WHERE relname=:name"), {"name": name}).scalar() is None
+        )
+    assert knowledge.read_page("/agent").text.startswith("# Agent")
